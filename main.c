@@ -44,7 +44,7 @@ void delete_overlay_from_overlays(Window window) {
     mtx_unlock(&overlay->mtx);
   }
 }
-int is_runing(Window window) {
+int is_running(Window window) {
   Overlay *overlay = NULL;
   void *key = (void *)window;
   HASH_FIND_PTR(g_overlays, &key, overlay);
@@ -104,6 +104,7 @@ Window make_x11_overlay(Display *display, Window target_window) {
       InputOutput, vinfo.visual,
       CWColormap | CWBackPixel | CWBorderPixel | CWOverrideRedirect,
       &overlay_attr);
+  XStoreName(display,overlay_window,"Dnd Overlay");
 
   // Set window type to dock to make it appear above other windows
   Atom _NET_WM_WINDOW_TYPE = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
