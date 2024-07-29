@@ -94,8 +94,7 @@ Window make_x11_overlay(Display *display, Window target_window) {
   overlay_attr.override_redirect = True;
   XWindowAttributes attr;
   if (!XGetWindowAttributes(display, target_window, &attr)) {
-    fprintf(stderr, "[xdnd] Cannot get target window(%ld) attributes\n",
-            target_window);
+    printf("[xdnd] Cannot get target window(%ld) attributes\n", target_window);
     return 0;
   }
 
@@ -126,6 +125,7 @@ Window make_x11_overlay(Display *display, Window target_window) {
                    PointerMotionMask | KeyPressMask | KeyReleaseMask |
                    ConfigureNotify | StructureNotifyMask);
 
+  XStoreName(display, overlay_window, "Xdnd overlay");
   // Map the overlay window
   XMapWindow(display, overlay_window);
   return overlay_window;
@@ -205,18 +205,28 @@ void *x11_event_loop(void *arg) {
       if (event.xclient.message_type == XdndEnter ||
           event.xclient.message_type == XdndPosition ||
           event.xclient.message_type == XdndLeave ||
+          event.xclient.message_type == XdndStatus ||
           event.xclient.message_type == XdndDrop) {
-        if (event.xclient.message_type == XdndPosition) {
-          set_is_dragging(overlay, 1);
-          // Extract the position of the drag
-          int x_root = (event.xclient.data.l[2] >> 16) & 0xFFFF;
-          int y_root = event.xclient.data.l[2] & 0xFFFF;
-          int x = 0;
-          int y = 0;
-          XTranslateCoordinates(param->display, root, event.xclient.window,
-                                x_root, y_root, &x, &y, &param->x11_overlay);
+        printf("[xdnd] dnd message: %s \n",
+               event.xclient.message_type == XdndEnter      ? "Enter"
+               : event.xclient.message_type == XdndPosition ? "position"
+               : event.xclient.message_type == XdndLeave    ? "Leave"
+               : event.xclient.message_type == XdndStatus   ? "Status"
+               : event.xclient.message_type == XdndDrop     ? "Drop"
+                                                            : "");
+        // Extract the position of the drag
+        int x_root = (event.xclient.data.l[2] >> 16) & 0xFFFF;
+        int y_root = event.xclient.data.l[2] & 0xFFFF;
+        int x = 0;
+        int y = 0;
+        XTranslateCoordinates(param->display, root, event.xclient.window,
+                              x_root, y_root, &x, &y, &param->x11_overlay);
+        printf("sendMotion %d %d %d %d\n", x_root, y_root, x, y);
+        if (x_root > 0 && y_root > 0) {
           sendMotion(x_root, y_root, x, y, param->display, root, target_window);
-
+        }
+        set_is_dragging(overlay, 1);
+        if (event.xclient.message_type == XdndPosition) {
           // Send XdndStatus message to acknowledge the position
           XClientMessageEvent reply;
           memset(&reply, 0, sizeof(reply));
