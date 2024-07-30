@@ -44,7 +44,7 @@ void delete_overlay_from_overlays(Window window) {
     mtx_unlock(&overlay->mtx);
   }
 }
-int is_running(Window window) {
+int is_runing(Window window) {
   Overlay *overlay = NULL;
   void *key = (void *)window;
   HASH_FIND_PTR(g_overlays, &key, overlay);
@@ -103,17 +103,17 @@ Window make_x11_overlay(Display *display, Window target_window) {
       InputOutput, vinfo.visual,
       CWColormap | CWBackPixel | CWBorderPixel | CWOverrideRedirect,
       &overlay_attr);
-  XStoreName(display,overlay_window,"Dnd Overlay");
+
+  Atom xa_atom = XInternAtom(display, "XA_ATOM", False);
 
   // Set window type to dock to make it appear above other windows
   Atom _NET_WM_WINDOW_TYPE = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
   Atom _NET_WM_WINDOW_TYPE_DOCK =
       XInternAtom(display, "_NET_WM_WINDOW_TYPE_DOCK", False);
-  XChangeProperty(display, overlay_window, _NET_WM_WINDOW_TYPE, XA_ATOM, 32,
+  XChangeProperty(display, overlay_window, _NET_WM_WINDOW_TYPE, xa_atom, 32,
                   PropModeReplace, (unsigned char *)&_NET_WM_WINDOW_TYPE_DOCK,
                   1);
   Atom version = 5;
-  Atom xa_atom = XInternAtom(display, "XA_ATOM", False);
 
   Atom XdndAware = XInternAtom(display, "XdndAware", False);
   XChangeProperty(display, overlay_window, XdndAware, xa_atom, 32,
@@ -146,6 +146,7 @@ void updateOverlayGeometry(Display *display, Window overlay_window,
 }
 void sendMotion(int x_root, int y_root, int x, int y, Display *display,
                 Window root, Window target) {
+
   XEvent event;
   memset(&event, 0, sizeof(event));
   event.type = MotionNotify;
@@ -167,12 +168,32 @@ void sendMotion(int x_root, int y_root, int x, int y, Display *display,
 
   XFlush(display);
 }
-static Atom XdndEnter, XdndPosition, XdndLeave, XdndDrop, XdndFinished,
-    XdndSelection, XdndStatus;
-void init_atoms(Display *display) {}
 
-void handleDnD(Display *display, Window overlay_window, Window target_window,
-               XEvent *event, Window root) {}
+static void sendXdndStatus(Display *disp, Atom XdndStatus, Window source,
+                           Window target, Atom action) {
+  XEvent message;
+  memset(&message, 0, sizeof(message));
+  message.xclient.type = ClientMessage;
+  message.xclient.display = disp;
+  message.xclient.window = target;
+  message.xclient.message_type = XdndStatus;
+  message.xclient.format = 32;
+  message.xclient.data.l[0] = source;
+  message.xclient.data.l[1] = 1; // Sets accept and want position flags
+
+  // Send back window rectangle coordinates and width
+  message.xclient.data.l[2] = 0;
+  message.xclient.data.l[3] = 0;
+
+  // Specify action we accept
+  message.xclient.data.l[4] = action;
+  int r = XSendEvent(disp, target, False, 0, &message);
+  if (r == 0) {
+    printf("[xdnd] Failed to send status\n");
+  } else {
+    printf("[xdnd] Status sent\n");
+  }
+}
 
 typedef struct {
   Window win;
@@ -195,67 +216,45 @@ void *x11_event_loop(void *arg) {
   Atom XdndFinished = XInternAtom(param->display, "XdndFinished", False);
   Atom XdndSelection = XInternAtom(param->display, "XdndSelection", False);
   Atom XdndStatus = XInternAtom(param->display, "XdndStatus", False);
+  Atom XdndActionCopy = XInternAtom(param->display, "XdndActionCopy", False);
 
   while (running) {
     mtx_lock(&overlay->mtx);
     running = overlay->is_running;
     mtx_unlock(&overlay->mtx);
     XNextEvent(param->display, &event);
+
     if (event.type == ClientMessage) {
       if (event.xclient.message_type == XdndEnter ||
           event.xclient.message_type == XdndPosition ||
           event.xclient.message_type == XdndLeave ||
           event.xclient.message_type == XdndStatus ||
           event.xclient.message_type == XdndDrop) {
-        printf("[xdnd] dnd message: %s \n",
-               event.xclient.message_type == XdndEnter      ? "Enter"
-               : event.xclient.message_type == XdndPosition ? "position"
-               : event.xclient.message_type == XdndLeave    ? "Leave"
-               : event.xclient.message_type == XdndStatus   ? "Status"
-               : event.xclient.message_type == XdndDrop     ? "Drop"
-                                                            : "");
-        // Extract the position of the drag
-        int x_root = (event.xclient.data.l[2] >> 16) & 0xFFFF;
-        int y_root = event.xclient.data.l[2] & 0xFFFF;
-        int x = 0;
-        int y = 0;
-        XTranslateCoordinates(param->display, root, event.xclient.window,
-                              x_root, y_root, &x, &y, &param->x11_overlay);
-        printf("sendMotion %d %d %d %d\n", x_root, y_root, x, y);
-        if (x_root > 0 && y_root > 0) {
-          sendMotion(x_root, y_root, x, y, param->display, root, target_window);
-        }
-        set_is_dragging(overlay, 1);
-        if (event.xclient.message_type == XdndPosition) {
-          // Send XdndStatus message to acknowledge the position
-          XClientMessageEvent reply;
-          memset(&reply, 0, sizeof(reply));
-          reply.type = ClientMessage;
-          reply.display = param->display;
-          reply.window = event.xclient.data.l[0]; // Source window
-          reply.message_type = XdndStatus;
-          reply.format = 32;
-          reply.data.l[0] = param->x11_overlay; // Target window
-          reply.data.l[1] = 1;                  // Accept the drop
-          reply.data.l[2] = 0;                  // Specify an empty rectangle
-          reply.data.l[3] = 0;
-          reply.data.l[4] = XdndSelection;
-
-          XSendEvent(param->display, event.xclient.data.l[0], False,
-                     NoEventMask, (XEvent *)&reply);
-          XFlush(param->display);
-        } else if (event.xclient.message_type == XdndLeave) {
+        if (event.xclient.message_type == XdndEnter ||
+            event.xclient.message_type == XdndPosition) {
+          set_is_dragging(overlay, 1);
+        } else if (event.xclient.message_type == XdndLeave ||
+                   event.xclient.message_type == XdndDrop) {
           set_is_dragging(overlay, 0);
         }
+        if (event.xclient.message_type == XdndPosition) {
+          sendXdndStatus(param->display, XdndStatus, param->x11_overlay,
+                         event.xclient.data.l[0], event.xclient.data.l[4]);
+        }
+        int x_root = (event.xclient.data.l[2] >> 16) & 0xFFFF;
+        int y_root = event.xclient.data.l[2] & 0xFFFF;
+        XWindowAttributes attr;
+        XGetWindowAttributes(param->display, param->x11_overlay, &attr);
+        int x = x_root - attr.x;
+        int y = y_root - attr.y;
+        sendMotion(x_root, y_root, x, y, param->display, root, target_window);
       }
-    } else if (event.type == ButtonPress || event.type == ButtonRelease ||
-               event.type == MotionNotify || event.type == KeyPress ||
-               event.type == KeyRelease) {
-      forwardEvent(param->display, &event, target_window);
     } else if (event.type == ConfigureNotify &&
                event.xconfigure.window == target_window) {
       // Target window has been moved or resized
       updateOverlayGeometry(param->display, param->x11_overlay, target_window);
+    } else {
+      forwardEvent(param->display, &event, target_window);
     }
   }
   XDestroyWindow(param->display, param->x11_overlay);
