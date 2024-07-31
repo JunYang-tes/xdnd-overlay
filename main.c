@@ -17,6 +17,8 @@ typedef struct {
   void *winid;
   int is_dragging;
   int is_running;
+  Window overlay;
+  Display *display;
   mtx_t mtx;
   UT_hash_handle hh;
 } Overlay;
@@ -31,6 +33,12 @@ Overlay *add_overlay(Window window) {
   mtx_init(&overlay->mtx, mtx_plain);
   HASH_ADD_PTR(g_overlays, winid, overlay);
   printf("Overlay added,key %ld\n", window);
+  return overlay;
+}
+Overlay *find_overlay(Window window) {
+  Overlay *overlay = NULL;
+  void *key = (void *)window;
+  HASH_FIND_PTR(g_overlays, &key, overlay);
   return overlay;
 }
 void delete_overlay_from_overlays(Window window) {
@@ -111,6 +119,7 @@ Window make_x11_overlay(Display *display, Window target_window) {
   Atom _NET_WM_WINDOW_TYPE_DOCK =
       XInternAtom(display, "_NET_WM_WINDOW_TYPE_DOCK", False);
   XChangeProperty(display, overlay_window, _NET_WM_WINDOW_TYPE, xa_atom, 32,
+
                   PropModeReplace, (unsigned char *)&_NET_WM_WINDOW_TYPE_DOCK,
                   1);
   Atom version = 5;
@@ -121,9 +130,9 @@ Window make_x11_overlay(Display *display, Window target_window) {
 
   // Select input events
   XSelectInput(display, overlay_window,
-               ExposureMask | ButtonPressMask | ButtonReleaseMask |
-                   PointerMotionMask | KeyPressMask | KeyReleaseMask |
-                   ConfigureNotify | StructureNotifyMask);
+               UnmapNotify | ExposureMask | ButtonPressMask |
+                   ButtonReleaseMask | PointerMotionMask | KeyPressMask |
+                   KeyReleaseMask | ConfigureNotify | StructureNotifyMask);
 
   XStoreName(display, overlay_window, "Xdnd overlay");
   // Map the overlay window
@@ -187,12 +196,7 @@ static void sendXdndStatus(Display *disp, Atom XdndStatus, Window source,
 
   // Specify action we accept
   message.xclient.data.l[4] = action;
-  int r = XSendEvent(disp, target, False, 0, &message);
-  if (r == 0) {
-    printf("[xdnd] Failed to send status\n");
-  } else {
-    printf("[xdnd] Status sent\n");
-  }
+  XSendEvent(disp, target, False, 0, &message);
 }
 
 typedef struct {
@@ -223,6 +227,9 @@ void *x11_event_loop(void *arg) {
     running = overlay->is_running;
     mtx_unlock(&overlay->mtx);
     XNextEvent(param->display, &event);
+    if (event.type == UnmapNotify) {
+      printf("[xdnd] unmap\n");
+    }
 
     if (event.type == ClientMessage) {
       if (event.xclient.message_type == XdndEnter ||
@@ -249,10 +256,6 @@ void *x11_event_loop(void *arg) {
         int y = y_root - attr.y;
         sendMotion(x_root, y_root, x, y, param->display, root, target_window);
       }
-    } else if (event.type == ConfigureNotify &&
-               event.xconfigure.window == target_window) {
-      // Target window has been moved or resized
-      updateOverlayGeometry(param->display, param->x11_overlay, target_window);
     } else {
       forwardEvent(param->display, &event, target_window);
     }
@@ -276,6 +279,8 @@ int make_a_overlay(lua_State *L) {
 
   Overlay *overlay = add_overlay(win);
   x11_event_loop_param *param = malloc(sizeof(x11_event_loop_param));
+  overlay->display = display;
+  overlay->overlay = x11_overlay;
   param->win = win;
   param->overlay = overlay;
   param->x11_overlay = x11_overlay;
@@ -297,10 +302,46 @@ int lua_is_dragging(lua_State *L) {
   return 1;
 }
 
+int hide_overlay(lua_State *L) {
+  unsigned long win = luaL_checknumber(L, 1);
+  Overlay *overlay = find_overlay(win);
+  if (!overlay) {
+    printf("[xdnd] can't hide overlay for %ld: Overlay not found", win);
+    return 0;
+  }
+  XUnmapWindow(overlay->display, (Window)overlay->overlay);
+  XFlush(overlay->display);
+  return 0;
+}
+int show_overlay(lua_State *L) {
+  unsigned long win = luaL_checknumber(L, 1);
+  Overlay *overlay = find_overlay(win);
+  if (!overlay) {
+    printf("[xdnd] can't show overlay for %ld: Overlay not found", win);
+    return 0;
+  }
+  XMapWindow(overlay->display, (Window)overlay->overlay);
+  XFlush(overlay->display);
+  return 0;
+}
+int update_geometry(lua_State *L) {
+  unsigned long win = luaL_checknumber(L, 1);
+  Overlay *overlay = find_overlay(win);
+  if (!overlay) {
+    printf("[xdnd] can't show overlay for %ld: Overlay not found", win);
+    return 0;
+  }
+  updateOverlayGeometry(overlay->display,overlay->overlay,win);
+  return 0;
+}
+
 __attribute__((visibility("default"))) int luaopen_libxdnd(lua_State *L) {
   static const luaL_Reg lib[] = {{"make_a_overlay", make_a_overlay},
                                  {"is_dragging", lua_is_dragging},
                                  {"dispose_overlay", dispose_overlay},
+                                 {"update_overlay_geometry",update_geometry},
+                                 {"hide", hide_overlay},
+                                 {"show", show_overlay},
                                  {NULL, NULL}};
   luaL_newlib(L, lib);
   return 1;
