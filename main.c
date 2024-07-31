@@ -17,6 +17,14 @@ typedef struct {
   void *winid;
   int is_dragging;
   int is_running;
+  /*
+   * the region the overlay window will cover
+   * */
+  int left;
+  int top;
+  int right;
+  int bottom;
+
   Window overlay;
   Display *display;
   mtx_t mtx;
@@ -30,6 +38,10 @@ Overlay *add_overlay(Window window) {
   overlay->winid = (void *)window;
   overlay->is_running = 1;
   overlay->is_dragging = 0;
+  overlay->left = 0;
+  overlay->right = 0;
+  overlay->top = 0;
+  overlay->bottom = 0;
   mtx_init(&overlay->mtx, mtx_plain);
   HASH_ADD_PTR(g_overlays, winid, overlay);
   printf("Overlay added,key %ld\n", window);
@@ -105,7 +117,6 @@ Window make_x11_overlay(Display *display, Window target_window) {
     printf("[xdnd] Cannot get target window(%ld) attributes\n", target_window);
     return 0;
   }
-
   Window overlay_window = XCreateWindow(
       display, root, attr.x, attr.y, attr.width, attr.height, 0, vinfo.depth,
       InputOutput, vinfo.visual,
@@ -118,10 +129,11 @@ Window make_x11_overlay(Display *display, Window target_window) {
   Atom _NET_WM_WINDOW_TYPE = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
   Atom _NET_WM_WINDOW_TYPE_DOCK =
       XInternAtom(display, "_NET_WM_WINDOW_TYPE_DOCK", False);
+  /*
   XChangeProperty(display, overlay_window, _NET_WM_WINDOW_TYPE, xa_atom, 32,
 
                   PropModeReplace, (unsigned char *)&_NET_WM_WINDOW_TYPE_DOCK,
-                  1);
+                  1);*/
   Atom version = 5;
 
   Atom XdndAware = XInternAtom(display, "XdndAware", False);
@@ -144,14 +156,6 @@ void forwardEvent(Display *display, XEvent *event, Window target_window) {
   event->xany.window = target_window;
   XSendEvent(display, target_window, False, SubstructureNotifyMask, event);
   XFlush(display);
-}
-void updateOverlayGeometry(Display *display, Window overlay_window,
-                           Window target_window) {
-  XWindowAttributes attr;
-  if (XGetWindowAttributes(display, target_window, &attr)) {
-    XMoveResizeWindow(display, overlay_window, attr.x, attr.y, attr.width,
-                      attr.height);
-  }
 }
 void sendMotion(int x_root, int y_root, int x, int y, Display *display,
                 Window root, Window target) {
@@ -227,9 +231,6 @@ void *x11_event_loop(void *arg) {
     running = overlay->is_running;
     mtx_unlock(&overlay->mtx);
     XNextEvent(param->display, &event);
-    if (event.type == UnmapNotify) {
-      printf("[xdnd] unmap\n");
-    }
 
     if (event.type == ClientMessage) {
       if (event.xclient.message_type == XdndEnter ||
@@ -255,6 +256,8 @@ void *x11_event_loop(void *arg) {
         int x = x_root - attr.x;
         int y = y_root - attr.y;
         sendMotion(x_root, y_root, x, y, param->display, root, target_window);
+      } else {
+        forwardEvent(param->display, &event, target_window);
       }
     } else {
       forwardEvent(param->display, &event, target_window);
@@ -265,6 +268,14 @@ void *x11_event_loop(void *arg) {
   mtx_destroy(&overlay->mtx);
   free(overlay);
   free(param);
+}
+void update_x11_overlay_geometry(Overlay *overlay) {
+  XWindowAttributes attr;
+  XGetWindowAttributes(overlay->display, (Window)overlay->winid, &attr);
+  XMoveResizeWindow(overlay->display, overlay->overlay, attr.x + overlay->left,
+                    attr.y + overlay->top, attr.width - overlay->right,
+                    attr.height - overlay->bottom);
+  XFlush(overlay->display);
 }
 
 int make_a_overlay(lua_State *L) {
@@ -306,7 +317,7 @@ int hide_overlay(lua_State *L) {
   unsigned long win = luaL_checknumber(L, 1);
   Overlay *overlay = find_overlay(win);
   if (!overlay) {
-    printf("[xdnd] can't hide overlay for %ld: Overlay not found", win);
+    printf("[xdnd] can't hide overlay for %ld: Overlay not found\n", win);
     return 0;
   }
   XUnmapWindow(overlay->display, (Window)overlay->overlay);
@@ -317,7 +328,8 @@ int show_overlay(lua_State *L) {
   unsigned long win = luaL_checknumber(L, 1);
   Overlay *overlay = find_overlay(win);
   if (!overlay) {
-    printf("[xdnd] can't show overlay for %ld: Overlay not found", win);
+    printf("[xdnd %s] can't show overlay for %ld: Overlay not found\n",
+           __func__, win);
     return 0;
   }
   XMapWindow(overlay->display, (Window)overlay->overlay);
@@ -328,18 +340,72 @@ int update_geometry(lua_State *L) {
   unsigned long win = luaL_checknumber(L, 1);
   Overlay *overlay = find_overlay(win);
   if (!overlay) {
-    printf("[xdnd] can't show overlay for %ld: Overlay not found", win);
+    printf("[xdnd %s] can't show overlay for %ld: Overlay not found\n",
+           __func__, win);
     return 0;
   }
-  updateOverlayGeometry(overlay->display,overlay->overlay,win);
+  if (lua_gettop(L) > 1) {
+    // [win, {left,top,right,bottom}]
+    lua_getfield(L, 2, "left");
+    overlay->left = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "top");
+    overlay->top = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "right");
+    overlay->right = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "bottom");
+    overlay->bottom = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+  }
+
+  update_x11_overlay_geometry(overlay);
   return 0;
+}
+
+Window find_sub_window(Display *display, Window root, Atom atom) {
+  Window parent, *children;
+  unsigned int nchildren;
+  int i;
+
+  if (XQueryTree(display, root, &root, &parent, &children, &nchildren)) {
+    for (i = 0; i < nchildren; i++) {
+      Atom type;
+      int format;
+      unsigned long nitems, bytes_after;
+      unsigned char *prop;
+      printf("[xdnd] %ld \n", children[i]);
+
+      if (XGetWindowProperty(display, children[i], atom, 0, 1, False,
+                             AnyPropertyType, &type, &format, &nitems,
+                             &bytes_after, &prop) == Success) {
+        if (prop != NULL) {
+          XFree(prop);
+          XFree(children);
+          return children[i];
+        }
+      }
+
+      Window result = find_sub_window(display, children[i], atom);
+      if (result != None) {
+        XFree(children);
+        return result;
+      }
+    }
+    XFree(children);
+  }
+  return None;
 }
 
 __attribute__((visibility("default"))) int luaopen_libxdnd(lua_State *L) {
   static const luaL_Reg lib[] = {{"make_a_overlay", make_a_overlay},
                                  {"is_dragging", lua_is_dragging},
                                  {"dispose_overlay", dispose_overlay},
-                                 {"update_overlay_geometry",update_geometry},
+                                 {"update_overlay_geometry", update_geometry},
                                  {"hide", hide_overlay},
                                  {"show", show_overlay},
                                  {NULL, NULL}};
